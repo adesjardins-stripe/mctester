@@ -113,7 +113,31 @@ type Config struct {
 	ZipfS          float64 // (> 1, generally 1.01-2) pulls the power curve toward 0)
 	ZipfV          float64 // v (< keySpace) puts the main part of the curve before this number
 
-	tachymeter *tachymeter.Tachymeter
+	cacheEntries []CacheEntry
+	tachymeter   *tachymeter.Tachymeter
+}
+
+type CacheEntry struct {
+	key   string
+	value []byte
+}
+
+func (conf *Config) GenerateEntries() (entries []CacheEntry) {
+	entries = make([]CacheEntry, conf.KeySpace)
+	subRS := pcgr.New(1, 0)
+
+	for i := 0; i < conf.KeySpace; i++ {
+		subRS.Seed(conf.RngSeed + int64(i))
+		key := mct.RandString(&subRS, conf.KeyLength, conf.KeyPrefix)
+
+		valSeed := new(big.Int).SetBytes([]byte(key)).Int64()
+		subRS.Seed(valSeed)
+		value := mct.RandBytes(&subRS, int(conf.ValueSize))
+
+		entries[i] = CacheEntry{key, value}
+	}
+
+	return
 }
 
 func (conf *Config) Run() (err error) {
@@ -123,6 +147,8 @@ func (conf *Config) Run() (err error) {
 	if samples < 1000 {
 		samples = 1000
 	}
+
+	conf.cacheEntries = conf.GenerateEntries()
 
 	if conf.WarmPercent > 0 {
 		err = conf.WarmCache()
@@ -172,19 +198,14 @@ func (conf *Config) Run() (err error) {
 
 func (conf *Config) WarmCache() error {
 	mc := mct.NewClient(conf.Servers[0], conf.Socket, conf.Pipelines, conf.KeyPrefix, conf.StripKeyPrefix)
-
 	rs := pcgr.New(conf.RngSeed, 0)
 	randR := rand.New(&rs)
-	subRS := pcgr.New(1, 0)
 
 	for keyIndex := 0; keyIndex < conf.KeySpace; keyIndex++ {
 		if randR.Intn(100) < conf.WarmPercent {
-			subRS.Seed(conf.RngSeed + int64(keyIndex))
-			key := mct.RandString(&subRS, conf.KeyLength, conf.KeyPrefix)
-
-			valSeed := new(big.Int).SetBytes([]byte(key)).Int64()
-			subRS.Seed(valSeed)
-			value := mct.RandBytes(&subRS, int(conf.ValueSize))
+			entry := conf.cacheEntries[keyIndex]
+			key := entry.key
+			value := entry.value
 
 			_, err := mc.Set(key, uint32(conf.ClientFlags), uint32(conf.KeyTTL), value)
 			if err != nil {
@@ -213,7 +234,6 @@ func (conf *Config) Worker(index int, results chan Stats) error {
 			return nil
 		}
 	}
-	subRS := pcgr.New(1, 0)
 
 	var rl ratelimit.Limiter
 	if conf.RPS > 0 {
@@ -228,15 +248,15 @@ func (conf *Config) Worker(index int, results chan Stats) error {
 			break
 		}
 
+		var index int
 		if conf.UseZipf {
-			subRS.Seed(conf.RngSeed + int64(zipRS.Uint64()))
+			index = int(zipRS.Uint64())
 		} else {
-			subRS.Seed(conf.RngSeed + int64(randR.Intn(conf.KeySpace)))
+			index = randR.Intn(conf.KeySpace)
 		}
 
-		key := mct.RandString(&subRS, conf.KeyLength, conf.KeyPrefix)
-		valSeed := new(big.Int).SetBytes([]byte(key)).Int64()
-		subRS.Seed(valSeed)
+		entry := conf.cacheEntries[index]
+		key := entry.key
 
 		switch rng := randR.Intn(conf.DelRatio + conf.SetRatio + conf.GetRatio); {
 		case rng < conf.DelRatio:
@@ -254,7 +274,7 @@ func (conf *Config) Worker(index int, results chan Stats) error {
 				stats.DeleteMisses++
 			}
 		case rng < (conf.DelRatio + conf.SetRatio):
-			value := mct.RandBytes(&subRS, int(conf.ValueSize))
+			value := entry.value
 			rl.Take()
 			_, err := mc.Set(key, uint32(conf.ClientFlags), uint32(conf.KeyTTL), value)
 			if err != nil {
@@ -275,13 +295,12 @@ func (conf *Config) Worker(index int, results chan Stats) error {
 			case mct.McHIT:
 				stats.GetHits++
 
-				if conf.ValidateGets {
-					expectedValue := mct.RandBytes(&subRS, int(conf.ValueSize))
-					if !bytes.Equal(value, expectedValue) {
-						stats.KeyCollisions++
-						fmt.Printf("Unexpected value found for key `%s`\n\tExpected Value: %s\n\tActual Value: %s\n", key, expectedValue, value)
-					}
+				expectedValue := entry.value
+				if conf.ValidateGets && !bytes.Equal(value, expectedValue) {
+					stats.KeyCollisions++
+					fmt.Printf("Unexpected value found for key `%s`\n\tExpected Value: %s\n\tActual Value: %s\n", key, expectedValue, value)
 				}
+
 			case mct.McMISS:
 				stats.GetMisses++
 			}
